@@ -1,276 +1,98 @@
-name: Build LLVM and OLLVM Plugin
-
-permissions:
-  contents: write
+name: Build OLLVM Pass (Windows x64)
 
 on:
-  release:
-    types: [published, edited, created]
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
-    inputs:
-      llvm_tag:
-        description: 'LLVM tag (e.g., rustc/21.1-2025-08-01)'
-        required: true
-        type: string
-      release_name:
-        description: 'Release name (optional)'
-        required: false
-        type: string
 
 jobs:
-  build-llvm:
-    runs-on: windows-latest  # 使用更大的实例，LLVM编译需要大量内存
-    strategy:
-      matrix:
-        config: [x64]
-
-    outputs:
-      artifact_name: ${{ steps.set-outputs.outputs.artifact_name }}
-      upload_url: ${{ steps.set-outputs.outputs.upload_url }}
+  build-windows:
+    name: Build OLLVM Pass on Windows x64
+    runs-on: windows-2022
 
     steps:
-      - name: Set CORES
-        run: echo "CORES=$env:NUMBER_OF_PROCESSORS" >> $env:GITHUB_ENV
-
-      - name: Resolve inputs
-        id: inputs
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            # 从release信息中提取
-            TAG="${{ github.event.release.tag_name }}"
-            RELEASE_NAME="${{ github.event.release.name }}"
-          else
-            # 从workflow_dispatch输入中获取
-            TAG="${{ inputs.llvm_tag }}"
-            RELEASE_NAME="${{ inputs.release_name }}"
-            if [ -z "$RELEASE_NAME" ]; then
-              RELEASE_NAME="LLVM $TAG"
-            fi
-          fi
-
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
-          echo "Resolved tag: $TAG, release name: $RELEASE_NAME"
-
-      - name: Checkout LLVM
-        uses: actions/checkout@v4
+      # ── 1. 初始化 MSVC x64 开发环境 ──────────────────────────────
+      - name: Setup MSVC x64 Developer Environment
+        uses: ilammy/msvc-dev-cmd@v1
         with:
-          repository: rust-lang/llvm-project
-          ref: ${{ steps.inputs.outputs.tag }}
-          path: llvm-project
-          fetch-depth: 1
+          arch: x64
 
+      # ── 2. 安装 Ninja ──────────────────────────────────────────────
       - name: Install Ninja
-        run: |
-          choco install ninja -y
+        shell: pwsh
+        run: choco install ninja --yes
 
-      - name: Create build directory
+      # ── 3. 克隆 rust-lang/llvm-project ───────────────────────────
+      - name: Clone rust-lang/llvm-project
+        shell: pwsh
         run: |
-          mkdir -p llvm-build
+          git clone --depth 1 `
+            --branch rustc/21.1-2025-08-01 `
+            https://github.com/rust-lang/llvm-project.git `
+            llvm-project
 
+      # ── 4. 缓存 LLVM 安装目录（避免每次重新编译 LLVM）────────────
+      - name: Cache LLVM Install
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: llvm-build/llvm_x64
+          key: llvm-windows-x64-rustc-21.1-2025-08-01-v1
+
+      # ── 5. CMake 配置 LLVM（仅 cache miss 时执行）─────────────────
       - name: Configure LLVM
-        shell: cmd
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        shell: pwsh
         run: |
-          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          cd llvm-build
-          cmake ../llvm-project/llvm ^
-            -G "Ninja" ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_INSTALL_PREFIX=llvm_x64 ^
-            -DLLVM_TARGETS_TO_BUILD="X86" ^
-            -DLLVM_ENABLE_PROJECTS="clang;lld" ^
-            -DLLVM_ENABLE_RUNTIMES="compiler-rt;libcxx;libcxxabi" ^
-            -DLLVM_ENABLE_ASSERTIONS=OFF ^
-            -DLLVM_INCLUDE_TESTS=OFF ^
-            -DLLVM_INCLUDE_EXAMPLES=OFF ^
-            -DLLVM_INCLUDE_BENCHMARKS=OFF ^
-            -DLLVM_BUILD_TOOLS=ON ^
-            -DLLVM_BUILD_UTILS=OFF ^
-            -DLLVM_USE_CRT_RELEASE=MT
-          if %errorlevel% neq 0 (
-            echo ::error::CMake configuration failed for LLVM
-            exit /b %errorlevel%
-          )
+          cmake -G "Ninja" `
+            -S llvm-project/llvm `
+            -B llvm-build/build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DLLVM_ENABLE_PROJECTS="" `
+            -DLLVM_TARGETS_TO_BUILD="X86" `
+            -DLLVM_INCLUDE_TESTS=OFF `
+            -DLLVM_INCLUDE_EXAMPLES=OFF `
+            -DLLVM_INCLUDE_BENCHMARKS=OFF `
+            -DCMAKE_INSTALL_PREFIX="llvm-build/llvm_x64"
 
-      - name: Build LLVM
-        shell: cmd
+      # ── 6. 编译 & 安装 LLVM（仅 cache miss 时执行）───────────────
+      - name: Build and Install LLVM
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: cmake --build llvm-build/build --target install -j12
+
+      # ── 7. 克隆 0xlane/ollvm-rust ─────────────────────────────────
+      - name: Clone 0xlane/ollvm-rust
+        shell: pwsh
         run: |
-          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          cd llvm-build
-          ninja -j ${{ env.CORES }}
-          if %errorlevel% neq 0 (
-            echo ::error::LLVM build failed
-            exit /b %errorlevel%
-          )
+          git clone --depth 1 `
+            --branch ollvm-pass `
+            https://github.com/0xlane/ollvm-rust.git `
+            ollvm-rust
 
-      - name: Install LLVM
-        shell: cmd
+      # ── 8. CMake 配置 OLLVM Pass ──────────────────────────────────
+      - name: Configure OLLVM Pass
+        shell: pwsh
         run: |
-          cd llvm-build
-          ninja install
-          if %errorlevel% neq 0 (
-            echo ::error::LLVM installation failed
-            exit /b %errorlevel%
-          )
+          cmake -G "Ninja" `
+            -S ollvm-rust/ollvm-pass `
+            -B ollvm-rust/build `
+            -DCMAKE_CXX_STANDARD=17 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=ON `
+            -DLT_LLVM_INSTALL_DIR="${{ github.workspace }}/llvm-build/llvm_x64"
 
-      - name: Package LLVM
-        shell: bash
-        run: |
-          # 创建7z包
-          7z a "rust-${{ steps.inputs.outputs.tag }}.7z" "./llvm-build/llvm_x64/*"
-          echo "Created rust-${{ steps.inputs.outputs.tag }}.7z"
+      # ── 9. 编译 OLLVM Pass ────────────────────────────────────────
+      - name: Build OLLVM Pass
+        shell: pwsh
+        run: cmake --build ollvm-rust/build -j12
 
-      - name: Set outputs
-        id: set-outputs
-        shell: bash
-        run: |
-          echo "artifact_name=rust-${{ steps.inputs.outputs.tag }}.7z" >> $GITHUB_OUTPUT
-          echo "upload_url=${{ github.event.release.upload_url }}" >> $GITHUB_OUTPUT
-
-      - name: Upload LLVM artifact
+      # ── 10. 上传产物 (.dll) ───────────────────────────────────────
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: rust-${{ steps.inputs.outputs.tag }}
-          path: rust-${{ steps.inputs.outputs.tag }}.7z
-          retention-days: 7
-
-      - name: Release LLVM
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.inputs.outputs.tag }}
-          name: ${{ steps.inputs.outputs.release_name }}
-          draft: false
-          prerelease: false
-          files: |
-            rust-${{ steps.inputs.outputs.tag }}.7z
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  build-ollvm:
-    needs: build-llvm
-    runs-on: windows-latest
-    strategy:
-      matrix:
-        config: [x64]
-
-    steps:
-      - name: Set CORES
-        run: echo "CORES=$env:NUMBER_OF_PROCESSORS" >> $env:GITHUB_ENV
-
-      - name: Download LLVM artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: rust-${{ needs.build-llvm.outputs.artifact_name }}
-          path: downloaded-llvm
-
-      - name: Extract LLVM
-        shell: bash
-        run: |
-          # 查找下载的7z文件
-          find . -name "*.7z" -exec 7z x {} -ollvm_x64 \;
-          
-          # 移动到标准位置
-          if [ -d "llvm_x64" ]; then
-            mkdir -p "C:/Program Files/LLVM"
-            cp -r llvm_x64/* "C:/Program Files/LLVM/"
-          fi
-
-      - name: Checkout ollvm-rust
-        uses: actions/checkout@v4
-        with:
-          repository: 0xlane/ollvm-rust
-          ref: ollvm-pass
-          path: ollvm-rust
-
-      - name: Install Ninja
-        run: |
-          choco install ninja -y
-
-      - name: Verify LLVM
-        shell: bash
-        run: |
-          LLVM_DIR="C:/Program Files/LLVM"
-          if [ ! -d "$LLVM_DIR" ]; then
-            echo "::error::LLVM not found at $LLVM_DIR"
-            exit 1
-          fi
-          echo "LLVM found at: $LLVM_DIR"
-          
-          # 列出关键文件验证
-          ls -la "$LLVM_DIR/bin/" || true
-          ls -la "$LLVM_DIR/lib/" || true
-
-      - name: Configure OLLVM
-        shell: cmd
-        working-directory: ./ollvm-rust
-        run: |
-          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          mkdir -p build
-          cd build
-          cmake ../ollvm-pass ^
-            -G "Ninja" ^
-            -DCMAKE_CXX_STANDARD=17 ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DBUILD_SHARED_LIBS=ON ^
-            -DLT_LLVM_INSTALL_DIR="C:/Program Files/LLVM"
-          if %errorlevel% neq 0 (
-            echo ::error::CMake configuration failed for OLLVM
-            exit /b %errorlevel%
-          )
-
-      - name: Build OLLVM
-        shell: cmd
-        working-directory: ./ollvm-rust/build
-        run: |
-          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          ninja -j ${{ env.CORES }}
-          if %errorlevel% neq 0 (
-            echo ::error::OLLVM build failed
-            exit /b %errorlevel%
-          )
-
-      - name: Find ollvm.dll
-        id: find-dll
-        shell: bash
-        working-directory: ./ollvm-rust
-        run: |
-          # 在所有build目录中查找
-          dll_path=$(find . -name "ollvm.dll" -type f | head -1)
-          if [ -z "$dll_path" ]; then
-            echo "::error::ollvm.dll not found"
-            find . -name "*.dll" -type f | head -10
-            exit 1
-          fi
-          echo "Found ollvm.dll at: $dll_path"
-          echo "dll_path=$dll_path" >> $GITHUB_OUTPUT
-
-      - name: Create plugin release package
-        shell: bash
-        run: |
-          TAG="${{ needs.build-llvm.outputs.artifact_name }}"
-          # 从rust-21.1-2025-08-01.7z中提取版本
-          VERSION=$(echo "$TAG" | sed 's/rust-\(.*\)\.7z/\1/')
-          cp "${{ steps.find-dll.outputs.dll_path }}" "ollvm-$VERSION.dll"
-          echo "Created ollvm-$VERSION.dll"
-
-      - name: Upload OLLVM artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ollvm-${{ needs.build-llvm.outputs.artifact_name }}
-          path: ollvm-*.dll
-          retention-days: 7
-
-      - name: Release OLLVM plugin
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ollvm-${{ github.event.release.tag_name }}
-          name: "OLLVM Plugin for ${{ github.event.release.tag_name }}"
-          draft: false
-          prerelease: false
-          files: |
-            ollvm-*.dll
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: ollvm-pass-windows-x64
+          path: ollvm-rust/build/**/*.dll
+          if-no-files-found: warn
