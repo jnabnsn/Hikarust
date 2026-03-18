@@ -67,9 +67,8 @@ jobs:
       - name: Clone 0xlane/ollvm-rust
         shell: pwsh
         run: |
-          git clone --depth 1 `
-            --branch ollvm-pass `
-            https://github.com/jnabnsn/Hikarust.git `
+          git clone --depth 1
+            https://github.com/jnabnsn/Hikarust.git
             ollvm-rust
 
       # ── 8. CMake 配置 OLLVM Pass ──────────────────────────────────
