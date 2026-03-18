@@ -7,6 +7,11 @@ on:
   release:
     types: [published, edited]
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v1.0) — required for manual trigger'
+        required: true
+        type: string
 
 jobs:
   build:
@@ -19,93 +24,159 @@ jobs:
       - name: Set CORES
         run: echo "CORES=$env:NUMBER_OF_PROCESSORS" >> $env:GITHUB_ENV
 
+      # ✅ 统一解析 tag，兼容 release 和 workflow_dispatch 两种触发方式
+      - name: Resolve tag name
+        id: resolve_tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${{ inputs.tag_name }}"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "::error::Tag name is empty. Please provide a tag."
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Resolved tag: $TAG"
+
+      # ✅ 防止 llvm 相关 tag 触发本 job
       - name: Check if can proceed
         shell: bash
-        id: pre-check
         run: |
-          if echo "${{ github.event.release.tag_name }}" | grep -q "llvm"; then
+          TAG="${{ steps.resolve_tag.outputs.tag }}"
+          if echo "$TAG" | grep -qi "llvm"; then
+            echo "::notice::Tag contains 'llvm', skipping plugin build."
             exit 1
           fi
 
       - name: Checkout ollvm repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4   # ✅ 修正：v6 不存在
         with:
           submodules: recursive
 
-      - name: Extract version from release tag
+      # ✅ 从统一 tag 中提取版本号
+      - name: Extract version from tag
         id: tag
-        run: |
-          $tag = "${{ github.event.release.tag_name }}"
-          $version = [regex]::Match($tag, '\d+\.\d+').Value
-          "version=$version" >> $env:GITHUB_OUTPUT
-
-      - name: Match tag
-        if: github.event_name == 'release'
-        shell: bash
-        id: version
-        run: |
-          TAG=${{ steps.tag.outputs.version }}
-          response=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases")
-
-          matching_tag=$(echo "$response" | jq -r --arg version "$TAG" '
-            [.[] | select(.tag_name | ascii_downcase | contains("llvm")) |
-            select(.tag_name | contains($version)) | .tag_name] |
-            sort | last
-          ')
-
-          if [ "$matching_tag" != "null" ] && [ -n "$matching_tag" ]; then
-              echo "Found matching LLVM release: $matching_tag"
-              echo "llvm_tag=$matching_tag" >> $GITHUB_OUTPUT
-          else
-              echo "No matching LLVM release found"
-              echo "llvm_tag=" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Download llvm.7z directly
-        if: steps.version.outputs.llvm_tag != ''
         shell: bash
         run: |
-          TAG=${{ steps.version.outputs.llvm_tag }}
-          REPO=${{ github.repository }}
+          TAG="${{ steps.resolve_tag.outputs.tag }}"
+          VERSION=$(echo "$TAG" | grep -oP '\d+\.\d+' | head -1)
 
-          download_url="https://github.com/$REPO/releases/download/$TAG/rust-$TAG.7z"
-          curl -L -o "rust-llvm.7z" "$download_url"
-
-          if [ -f "rust-llvm.7z" ]; then
-            echo "Download successful"
-            7z x rust-llvm.7z -o"C:\Program Files" -aoa
-          else
-            echo "Download failed"
+          if [ -z "$VERSION" ]; then
+            echo "::error::Cannot extract version from tag: $TAG"
             exit 1
           fi
 
-      - name: Build llvm-rust
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VERSION"
+
+      # ✅ 移除 if 条件，始终查找匹配的 LLVM release（兼容两种触发方式）
+      - name: Match LLVM release tag
+        id: version
+        shell: bash
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          response=$(curl -s \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases")
+
+          matching_tag=$(echo "$response" | jq -r --arg v "$VERSION" '
+            [.[] 
+              | select(.tag_name | ascii_downcase | contains("llvm"))
+              | select(.tag_name | contains($v))
+              | .tag_name
+            ] | sort | last
+          ')
+
+          if [ "$matching_tag" = "null" ] || [ -z "$matching_tag" ]; then
+            echo "::error::No matching LLVM release found for version: $VERSION"
+            exit 1
+          fi
+
+          echo "Found matching LLVM release: $matching_tag"
+          echo "llvm_tag=$matching_tag" >> $GITHUB_OUTPUT
+
+      # ✅ 下载并解压 LLVM
+      - name: Download and extract LLVM
+        shell: bash
+        run: |
+          TAG="${{ steps.version.outputs.llvm_tag }}"
+          REPO="${{ github.repository }}"
+          URL="https://github.com/$REPO/releases/download/$TAG/rust-$TAG.7z"
+
+          echo "Downloading: $URL"
+          curl -L --fail -o "rust-llvm.7z" "$URL" || {
+            echo "::error::Failed to download LLVM from $URL"
+            exit 1
+          }
+
+          echo "Extracting..."
+          7z x rust-llvm.7z -o"C:\\Program Files" -aoa
+          echo "Extraction complete."
+
+      # ✅ 新增：验证 LLVM 路径，防止 cmake 配置失败后继续执行
+      - name: Verify LLVM installation
+        shell: bash
+        run: |
+          LLVM_CMAKE_DIR="C:/Program Files/LLVM/lib/cmake/llvm"
+          if [ ! -d "$LLVM_CMAKE_DIR" ]; then
+            echo "::error::LLVM cmake dir not found: $LLVM_CMAKE_DIR"
+            exit 1
+          fi
+          echo "LLVM verified at: $LLVM_CMAKE_DIR"
+
+      # ✅ cmake 配置和编译分步，errorlevel 检测确保失败时终止
+      - name: Configure cmake
         shell: cmd
         run: |
           call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           cmake -B build_llvm -G Ninja ^
-          -S .\ollvm-pass ^
-          -DCMAKE_CXX_STANDARD=17 ^
-          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} ^
-          -DBUILD_SHARED_LIBS=ON ^
-          -DLLVM_DIR="C:/Program Files/LLVM/lib/cmake/llvm"
-          cmake --build build_llvm --config ${{ env.BUILD_TYPE }} --verbose -j ${{ env.CORES }}
+            -S .\ollvm-pass ^
+            -DCMAKE_CXX_STANDARD=17 ^
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} ^
+            -DBUILD_SHARED_LIBS=ON ^
+            -DLLVM_DIR="C:/Program Files/LLVM/lib/cmake/llvm"
+          if %errorlevel% neq 0 (
+            echo ::error::CMake configuration failed
+            exit /b %errorlevel%
+          )
 
-      - name: list dll
+      - name: Build plugin
+        shell: cmd
         run: |
-          Get-ChildItem -Path . -Filter ollvm.dll -Recurse
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build build_llvm --config ${{ env.BUILD_TYPE }} --verbose -j ${{ env.CORES }}
+          if %errorlevel% neq 0 (
+            echo ::error::Build failed
+            exit /b %errorlevel%
+          )
 
-      - name: Release
+      # ✅ 找到 dll 并输出路径，避免路径写死
+      - name: Locate ollvm.dll
+        id: find_dll
+        shell: bash
+        run: |
+          dll=$(find . -name "ollvm.dll" | head -1)
+          if [ -z "$dll" ]; then
+            echo "::error::ollvm.dll not found after build"
+            exit 1
+          fi
+          echo "dll_path=$dll" >> $GITHUB_OUTPUT
+          echo "Found: $dll"
+
+      - name: Upload to Release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'release'
         with:
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ steps.resolve_tag.outputs.tag }}
           name: ${{ github.event.release.name }}
           draft: false
           prerelease: false
-          files: |
-            ollvm.dll
+          files: ${{ steps.find_dll.outputs.dll_path }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
