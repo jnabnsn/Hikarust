@@ -19,7 +19,7 @@ on:
 
 jobs:
   build-llvm:
-    runs-on: windows-latest-16  # 使用更大的实例，LLVM编译需要大量内存
+    runs-on: windows-latest  # 使用更大的实例，LLVM编译需要大量内存
     strategy:
       matrix:
         config: [x64]
