@@ -24,6 +24,25 @@ jobs:
       - name: Set CORES
         run: echo "CORES=$env:NUMBER_OF_PROCESSORS" >> $env:GITHUB_ENV
 
+      # ✅ 统一解析 tag，兼容 release 和 workflow_dispatch 两种触发方式
+      - name: Resolve tag name
+        id: resolve_tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${{ inputs.tag_name }}"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "::error::Tag name is empty. Please provide a tag."
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Resolved tag: $TAG"
+
       # ✅ 防止 llvm 相关 tag 触发本 job
       - name: Check if can proceed
         shell: bash
@@ -44,8 +63,8 @@ jobs:
         id: tag
         shell: bash
         run: |
-          TAG="rustc/21.1-2025-08-01"
-          VERSION=$(echo "$TAG" | grep -oP '\d+\.\d+' | head -1)
+          TAG="${{ steps.resolve_tag.outputs.tag }}"
+          VERSION=$(echo "$TAG" | grep -oE '[0-9]+\.[0-9]+' | head -1)
 
           if [ -z "$VERSION" ]; then
             echo "::error::Cannot extract version from tag: $TAG"
