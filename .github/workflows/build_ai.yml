@@ -95,5 +95,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ollvm-pass-windows-x64
-          path: ./ollvm.dll
+          path: D:\\a\\Hikarust\\Hikarust\\Hikarust\\ollvm.dll
           if-no-files-found: warn
