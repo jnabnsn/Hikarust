@@ -91,5 +91,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ollvm-pass-windows-x64
-          path: Hikarust/build/**/*.dll
+          path: ./build/**/*.dll
           if-no-files-found: warn
