@@ -86,6 +86,10 @@ jobs:
         shell: pwsh
         run: cmake --build Hikarust/build -j12
 
+      - name: list dll
+        run: |
+          Get-ChildItem -Path . -Filter ollvm.dll -Recurse
+
       # ── 10. 上传产物 (.dll) ───────────────────────────────────────
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
